@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
-"""
-Interactive Image Mosaic Generator (Gradio)
 
-What this version does:
-- Grid size = number of cells per side (16, 32, 64, 128) — NOT pixels.
-- Runs BOTH Vectorized & Loop implementations every time (timings + MSE/SSIM shown).
-- No color-space selector in UI; perceptual matching uses LAB internally.
-- Adds Tile Size (px): downsample each selected tile to this inner resolution, then scale
-  to the cell size (for a blocky mosaic look). It’s independent of grid size and auto-clamped ≤ cell size.
-- Optional color quantization on the input before analysis (toggle).
-- Download buttons for the two mosaics (Vectorized / Loop), no file list UI.
-- Tiles loaded from Hugging Face: "uoft-cs/cifar100" (fallback: "cifar100").
-"""
+
 
 import time
 import tempfile
