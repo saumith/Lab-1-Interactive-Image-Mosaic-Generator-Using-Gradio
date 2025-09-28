@@ -1,6 +1,6 @@
 # 🧩 Interactive Image Mosaic Generator
 
-An interactive mosaic generator that reconstructs an uploaded image using small image tiles. Built with Python, NumPy, scikit-image, scikit-learn, Hugging Face Datasets, and Gradio.
+An interactive mosaic generator that reconstructs an uploaded image using small image tiles from **CIFAR-100**. Built with **Python, NumPy, scikit-image, Hugging Face Datasets, and Gradio**.
 
 ---
 
@@ -12,84 +12,71 @@ Try it out online: **[Mosaic Generator Demo](https://huggingface.co/spaces/Saumi
 
 ## 🔍 Features
 
-- **Real-time mosaic generation** from uploaded images
-- **CIFAR-100 dataset integration** - Tiles drawn from the `uoft-cs/cifar100` dataset
-- **Adjustable grid size** - Range from 16px up to 128px for different detail levels
-- **Multiple similarity metrics**:
-  - **MSE** (Mean Squared Error) - measures pixel-level differences
-  - **SSIM** (Structural Similarity Index) - measures perceptual similarity
-- **Advanced options**:
-  - **Unique tiles mode** - Avoid repeat tile usage when possible
-  - **Random transformations** - Flip and rotate tiles for aesthetic variety
-- **Optimized implementations**:
-  - **Vectorized NumPy** processing for maximum speed
-  - **Loop-based** implementation as baseline comparison
-- **Performance optimizations** with intelligent caching
+- **Grid sizes**: 16, 32, 64, 128 (cells per side — not pixels)
+- **Tile size (px)**: Downsample CIFAR tiles (8/16/24/32) then scale to the grid cell size for a chunky effect
+- **CIFAR-100 dataset integration** — tiles drawn from `uoft-cs/cifar100` (with fallback to `cifar100`)
+- **Both implementations always run**:
+  - **Vectorized NumPy** (fast)
+  - **Loop-based** (reference)
+- **Similarity metrics**:
+  - **MSE** (Mean Squared Error)
+  - **SSIM** (Structural Similarity Index)
+- **Optional preprocessing**:
+  - Input **color quantization** (median cut) to simplify palette
+- **Usability**:
+  - **Grid overlay preview**
+  - **Download buttons** for mosaics (PNG)
 
 ---
 
 ## 🧱 How It Works
 
-### 1. **Preprocessing**
-Input image is resized and center-cropped to make its dimensions divisible by the chosen grid size.
+1. **Preprocessing**  
+   - Image is cropped so dimensions are divisible by the chosen grid size.  
+   - Optional color quantization reduces palette size.
 
-### 2. **Grid Segmentation** 
-The image is split into equal-sized cells, and each cell's average RGB color is computed.
+2. **Grid Segmentation**  
+   - Image is split into cells. Each cell's mean LAB color is computed.
 
-### 3. **Tile Preparation**
-CIFAR-100 images are scaled to match the grid cell size. Each tile's mean color is computed in LAB color space for optimal perceptual matching.
+3. **Tile Preparation**  
+   - CIFAR-100 tiles are resized.  
+   - Each tile's mean LAB color is precomputed.
 
-### 4. **Tile Mapping**
-For each cell, the nearest tile (in LAB color space) is selected using distance metrics. Tiles can optionally be used uniquely or randomly transformed.
+4. **Tile Mapping**  
+   - Each cell is matched to its nearest tile in LAB space.  
+   - Both vectorized and loop implementations are run.
 
-### 5. **Mosaic Construction**
-Selected tiles are assembled into the final mosaic, which is then resized to match the original image dimensions for accurate metric evaluation.
+5. **Mosaic Construction**  
+   - Tiles are assembled into the mosaic.  
+   - Tile size (px) controls blockiness.  
+   - Results are downloadable.
 
-### 6. **Quality Metrics**
-- **MSE**: Measures raw pixel differences (lower is better)
-- **SSIM**: Measures structural and perceptual similarity (0–1 scale, higher is better)
+6. **Quality Metrics**  
+   - **MSE**: pixel-wise difference (lower = better).  
+   - **SSIM**: perceptual similarity (0–1 scale, higher = better).
 
 ---
 
 ## 📦 Installation
 
 ### Prerequisites
-- Python 3.8 or higher
-- pip package manager
+- Python 3.9–3.11 recommended  
+- pip package manager  
 
 ### Setup
-
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/MosaicGeneration.git
-cd MosaicGeneration
+git clone git@github.com:saumith/Lab-1-Interactive-Image-Mosaic-Generator-Using-Gradio.git
+cd Lab-1-Interactive-Image-Mosaic-Generator-Using-Gradio
 
-# Create virtual environment (recommended)
+# Create virtual environment
 python3 -m venv .venv
-
-# Activate virtual environment
-# On macOS/Linux:
-source .venv/bin/activate
-# On Windows:
-# .venv\Scripts\activate
+source .venv/bin/activate   # macOS/Linux
+# .venv\Scripts\activate    # Windows
 
 # Install dependencies
 pip install -r requirements.txt
 ```
-
-### Requirements
-```txt
-gradio>=4.0.0
-numpy>=1.21.0
-scikit-image>=0.19.0
-scikit-learn>=1.0.0
-datasets>=2.0.0
-huggingface_hub>=0.10.0
-Pillow>=9.0.0
-matplotlib>=3.5.0
-```
-
----
 
 ## ▶️ Running Locally
 
@@ -97,48 +84,33 @@ matplotlib>=3.5.0
 python app.py
 ```
 
-Open your browser and navigate to the displayed address (typically `http://localhost:7860`) to access the Gradio interface.
+Open the Gradio link (usually http://127.0.0.1:7860) to use the app.
 
 ---
 
 ## 📊 Performance & Trade-offs
 
-### Speed Optimization
-- **Vectorized implementation** is significantly faster than loop-based processing
-- **Tile mapping** is the primary computational bottleneck, especially for fine grids
-- **Caching mechanisms** reduce redundant calculations
+See LAB1-REPORT.pdf for detailed metrics (MSE, SSIM, runtimes).
 
-### Quality vs Speed Trade-offs
-| Grid Size | Detail Level | Runtime | Use Case |
-|-----------|--------------|---------|----------|
-| 16px | High detail | 2-5s | Artistic, high-quality output |
-| 32px | Medium detail | 1-2s | Balanced quality/speed |
-| 64px | Lower detail | 0.5-1s | Quick previews |
-| 128px | Abstract | <0.5s | Rapid prototyping |
+**Key insights:**
+- Vectorization is 2–4× faster than loop-based processing.
+- Tile mapping dominates runtime, especially for small grids.
 
-### Metrics Comparison
-- **SSIM** provides better perceptual quality assessment than MSE
-- **MSE** is useful for pixel-level accuracy measurement
-- Mosaics inherently have high pixel error but can preserve structural similarity
+**Trade-off:**
+- **16×16** → Higher SSIM (best structure), slower
+- **32×32** → Best balance (moderate runtime + acceptable quality)
+- **64×64** → Fastest, but lower SSIM (blocky)
 
 ---
 
 ## 📂 Project Structure
 
 ```
-MosaicGeneration/
-├── app.py                 # Main Gradio application
-├── requirements.txt       # Python dependencies
-├── README.md             # Project documentation
-├── examples/             # Sample input images
-│   ├── landscape.jpg
-│   ├── portrait.jpg
-│   └── abstract.jpg
-└── src/                  # Source code modules
-    ├── __init__.py
-    ├── mosaic_generator.py    # Core mosaic logic
-    ├── tile_processor.py     # Tile preparation and caching
-    └── metrics.py            # Quality evaluation metrics
+Lab-1-Interactive-Image-Mosaic-Generator-Using-Gradio/
+├── app.py             # Main Gradio app
+├── requirements.txt   # Python dependencies
+├── README.md          # Project documentation
+└── LAB1-REPORT.pdf    # Performance report with results
 ```
 
 ---
@@ -146,16 +118,11 @@ MosaicGeneration/
 ## 🚀 Deployment
 
 ### Hugging Face Spaces
-This application is deployed on Hugging Face Spaces for easy public access.
-
-**Live Demo**: [Mosaic Generator Demo](https://huggingface.co/spaces/Saumith/MosaicGeneration)
+This app is live on Hugging Face Spaces:
+👉 [Mosaic Generator Demo](https://huggingface.co/spaces/Saumith/MosaicGeneration)
 
 ### Local Deployment
-For production deployment, consider:
-- Using Docker containers for consistent environments
-- Implementing proper error handling and logging
-- Adding rate limiting for API endpoints
-- Optimizing for your specific hardware configuration
-
----
-
+For reproducibility:
+- Use runtime.txt (e.g., python-3.10) if deploying to Hugging Face
+- Enable caching to speed up CIFAR-100 dataset load
+- Vectorized implementation recommended for interactive use
