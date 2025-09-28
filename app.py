@@ -1,311 +1,362 @@
+#!/usr/bin/env python3
+"""
+Interactive Image Mosaic Generator (Gradio)
+
+What this version does:
+- Grid size = number of cells per side (16, 32, 64, 128) — NOT pixels.
+- Runs BOTH Vectorized & Loop implementations every time (timings + MSE/SSIM shown).
+- No color-space selector in UI; perceptual matching uses LAB internally.
+- Adds Tile Size (px): downsample each selected tile to this inner resolution, then scale
+  to the cell size (for a blocky mosaic look). It’s independent of grid size and auto-clamped ≤ cell size.
+- Optional color quantization on the input before analysis (toggle).
+- Download buttons for the two mosaics (Vectorized / Loop), no file list UI.
+- Tiles loaded from Hugging Face: "uoft-cs/cifar100" (fallback: "cifar100").
+"""
+
 import time
-from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+import tempfile
+from typing import Tuple
 
-import gradio as gr
 import numpy as np
-from PIL import Image
-from skimage.metrics import structural_similarity as ssim
-from skimage.color import rgb2lab
-from sklearn.cluster import KMeans
+from PIL import Image, ImageDraw
+import gradio as gr
 
-# ---- Hugging Face dataset: hard-wired to CIFAR-100 ----
+from skimage.metrics import structural_similarity as ssim_metric
+from skimage.color import rgb2lab
 from datasets import load_dataset
 
-HF_DATASET = "uoft-cs/cifar100"  # tiles come from here
-HF_SPLIT = "train"
-TILE_LIMIT = 0                # cap to keep mapping fast (adjust as needed)
-BASE_TILE_SIZE = 32              # CIFAR-100 images are 32x32
 
-# Global caches
-_TILES_RAW_32: Optional[List[np.ndarray]] = None  # list of 32x32 RGB uint8 arrays
-_TILE_CACHE_BY_SIZE: Dict[int, Tuple[List[np.ndarray], np.ndarray]] = {}  # size -> (tiles_resized, lab_means)
+# ----------------------------
+# Utilities
+# ----------------------------
+def pil_to_np_rgb(img: Image.Image) -> np.ndarray:
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return np.asarray(img).astype(np.float32)
 
-# =======================
-# Image utils
-# =======================
-def pil_to_np(img: Image.Image) -> np.ndarray:
-    return np.asarray(img.convert("RGB"))
-
-def np_to_pil(arr: np.ndarray) -> Image.Image:
+def np_rgb_to_pil(arr: np.ndarray) -> Image.Image:
     arr = np.clip(arr, 0, 255).astype(np.uint8)
-    return Image.fromarray(arr)
+    return Image.fromarray(arr, mode="RGB")
 
-def center_crop_to_multiple(img: np.ndarray, cell: int) -> np.ndarray:
-    h, w = img.shape[:2]
-    H = (h // cell) * cell
-    W = (w // cell) * cell
-    top = (h - H) // 2
-    left = (w - W) // 2
-    return img[top:top+H, left:left+W, :]
+def to_lab(arr_rgb: np.ndarray) -> np.ndarray:
+    # arr in [0,255]
+    return rgb2lab(arr_rgb / 255.0)
 
-def resize_short_side(img: np.ndarray, short_side: int) -> np.ndarray:
-    h, w = img.shape[:2]
-    if min(h, w) == short_side:
+def maybe_quantize(img: Image.Image, enabled: bool, colors: int) -> Image.Image:
+    if not enabled:
         return img
-    if h < w:
-        new_h, new_w = short_side, int(w * short_side / h)
-    else:
-        new_h, new_w = int(h * short_side / w), short_side
-    return np.asarray(Image.fromarray(img).resize((new_w, new_h), Image.BILINEAR))
+    # Median-cut quantization; disable dithering to avoid speckle
+    return img.convert("RGB").quantize(
+        colors=colors, method=Image.MEDIANCUT, dither=Image.Dither.NONE
+    ).convert("RGB")
 
-def mse(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.mean((a.astype(np.float32) - b.astype(np.float32))**2))
-
-# =======================
-# CIFAR-100: load & cache base tiles (32x32)
-# =======================
-def _load_tiles_raw_32(limit: int = TILE_LIMIT) -> List[np.ndarray]:
-    """Load 32x32 tiles (RGB uint8) from CIFAR-100 (uoft-cs/cifar100)."""
-    global _TILES_RAW_32
-    if _TILES_RAW_32 is not None:
-        return _TILES_RAW_32
-
-    ds = load_dataset(HF_DATASET, split=HF_SPLIT)
-    tiles = []
-    for i, ex in enumerate(ds):
-        # CIFAR-100 column name is "img"
-        if "img" not in ex:
-            continue
-        img: Image.Image = ex["img"].convert("RGB")
-        if img.size != (BASE_TILE_SIZE, BASE_TILE_SIZE):
-            img = img.resize((BASE_TILE_SIZE, BASE_TILE_SIZE), Image.BILINEAR)
-        tiles.append(np.asarray(img))
-        if limit > 0 and len(tiles) >= limit:
-            break
-
-    if len(tiles) == 0:
-        raise gr.Error(f"No tiles loaded from {HF_DATASET}.")
-    _TILES_RAW_32 = tiles
-    return _TILES_RAW_32
-
-def _average_color_lab(tile: np.ndarray) -> np.ndarray:
-    lab = rgb2lab(tile / 255.0)
+def mean_color(arr_rgb: np.ndarray) -> np.ndarray:
+    # Mean in LAB for perceptual matching
+    lab = to_lab(arr_rgb)
     return lab.reshape(-1, 3).mean(axis=0)
 
-def _tiles_for_cell_size(cell_size: int) -> Tuple[List[np.ndarray], np.ndarray]:
+
+# ----------------------------
+# Dataset tiles
+# ----------------------------
+class TileBank:
+    def __init__(self):
+        self.tile_images = None  # list[PIL.Image]
+        self.features = None     # (N,3) mean LAB
+
+    def load(self, sample_size: int = 2000) -> None:
+        """Deterministic: take the first N images from CIFAR-100."""
+        try:
+            ds = load_dataset("uoft-cs/cifar100", split="train")
+        except Exception:
+            ds = load_dataset("cifar100", split="train")
+
+        n = min(sample_size, len(ds))
+        imgs, feats = [], []
+        for i in range(n):
+            rec = ds[i]
+            if "img" in rec and isinstance(rec["img"], Image.Image):
+                pil_img = rec["img"].convert("RGB")
+            elif "image" in rec and isinstance(rec["image"], Image.Image):
+                pil_img = rec["image"].convert("RGB")
+            else:
+                arr = rec.get("img", rec.get("image", None))
+                if arr is None:
+                    continue
+                pil_img = Image.fromarray(np.array(arr)).convert("RGB")
+
+            arr_rgb = pil_to_np_rgb(pil_img)
+            feats.append(mean_color(arr_rgb))
+            imgs.append(pil_img)
+
+        self.tile_images = imgs
+        self.features = np.vstack(feats) if feats else np.zeros((0, 3), dtype=np.float32)
+
+    def nearest_tile_indices(self, cell_means: np.ndarray, vectorized: bool = True) -> np.ndarray:
+        if self.features is None or len(self.features) == 0:
+            raise RuntimeError("TileBank not loaded or empty.")
+
+        A = cell_means.astype(np.float32)     # (K,3)
+        B = self.features.astype(np.float32)  # (N,3)
+
+        if vectorized:
+            # Pairwise L2 using (a-b)^2 = a^2 + b^2 - 2ab
+            A2 = (A**2).sum(axis=1, keepdims=True)     # Kx1
+            B2 = (B**2).sum(axis=1, keepdims=True).T   # 1xN
+            AB = A @ B.T                                # KxN
+            d2 = A2 + B2 - 2 * AB
+            return np.argmin(d2, axis=1)
+        else:
+            idxs = []
+            for cm in A:
+                d2 = ((B - cm) ** 2).sum(axis=1)
+                idxs.append(int(np.argmin(d2)))
+            return np.array(idxs, dtype=int)
+
+
+# ----------------------------
+# Grid helpers
+# ----------------------------
+def crop_to_multiple(img: Image.Image, grid_n: int) -> Image.Image:
+    """Crop minimally so width/height are multiples of grid_n (ensures integral cells)."""
+    w, h = img.size
+    new_w = max((w // grid_n) * grid_n, grid_n)
+    new_h = max((h // grid_n) * grid_n, grid_n)
+    if new_w != w or new_h != h:
+        img = img.crop((0, 0, new_w, new_h))
+    return img
+
+def overlay_grid(img: Image.Image, grid_n: int, line_width: int = 1) -> Image.Image:
+    img = img.copy()
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    cell_w = w // grid_n
+    cell_h = h // grid_n
+    for x in range(0, w + 1, cell_w):
+        draw.line([(x, 0), (x, h)], fill=(255, 0, 0), width=line_width)
+    for y in range(0, h + 1, cell_h):
+        draw.line([(0, y), (w, y)], fill=(255, 0, 0), width=line_width)
+    return img
+
+def prepare_cells_and_means(base_img: Image.Image, grid_n: int):
     """
-    Return (tiles_resized, tiles_lab_means) for the requested cell size.
-    Caches results to avoid recomputation on each run.
+    Returns:
+      - original RGB array (HxWx3 float32)
+      - dims: (w,h,cell_w,cell_h)
+      - cell_means_lab: (grid_n*grid_n, 3) mean in LAB per cell
     """
-    if cell_size in _TILE_CACHE_BY_SIZE:
-        return _TILE_CACHE_BY_SIZE[cell_size]
+    img = base_img.convert("RGB")
+    w, h = img.size
+    cell_w = w // grid_n
+    cell_h = h // grid_n
+    arr = pil_to_np_rgb(img)  # HxWx3 in [0,255]
 
-    raw_tiles = _load_tiles_raw_32()
-    if cell_size == BASE_TILE_SIZE:
-        tiles_resized = raw_tiles
-    else:
-        tiles_resized = [
-            np.asarray(Image.fromarray(t).resize((cell_size, cell_size), Image.BILINEAR))
-            for t in raw_tiles
-        ]
-    tiles_lab = np.array([_average_color_lab(t) for t in tiles_resized], dtype=np.float32)
-    _TILE_CACHE_BY_SIZE[cell_size] = (tiles_resized, tiles_lab)
-    return tiles_resized, tiles_lab
+    lab = to_lab(arr)
+    cells = lab.reshape(grid_n, cell_h, grid_n, cell_w, 3).swapaxes(1, 2)     # (grid_n,grid_n,cell_h,cell_w,3)
+    means = cells.mean(axis=(2, 3)).reshape(-1, 3)                             # (grid_n*grid_n,3)
+    return arr, (w, h, cell_w, cell_h), means
 
-# =======================
-# Grid / quantization
-# =======================
-def grid_mean_colors_vectorized(img: np.ndarray, cell: int) -> Tuple[np.ndarray, int, int]:
-    H, W = img.shape[:2]
-    assert H % cell == 0 and W % cell == 0
-    r = H // cell
-    c = W // cell
-    v = img.reshape(r, cell, c, cell, 3).mean(axis=(1, 3))
-    return v.astype(np.float32), r, c
 
-def grid_mean_colors_loop(img: np.ndarray, cell: int) -> Tuple[np.ndarray, int, int]:
-    H, W = img.shape[:2]
-    r = H // cell
-    c = W // cell
-    out = np.zeros((r, c, 3), dtype=np.float32)
-    for i in range(r):
-        for j in range(c):
-            patch = img[i*cell:(i+1)*cell, j*cell:(j+1)*cell]
-            out[i, j] = patch.mean(axis=(0,1))
-    return out, r, c
+# ----------------------------
+# Mosaic composition
+# ----------------------------
+def downsample_then_scale(tile_img: Image.Image, inner_px: int, target_w: int, target_h: int) -> Image.Image:
+    """
+    Downsample a CIFAR tile to inner_px (e.g., 8/16/24/32) to control blockiness,
+    then scale up to the target cell size with NEAREST to preserve the chunky effect.
+    """
+    inner_px = max(1, int(inner_px))
+    tiny = tile_img.resize((inner_px, inner_px), Image.BILINEAR)
+    return tiny.resize((target_w, target_h), Image.NEAREST)
 
-def quantize_image_kmeans(img: np.ndarray, k: int) -> np.ndarray:
-    if k <= 0:
-        return img
-    h, w = img.shape[:2]
-    flat = img.reshape(-1, 3).astype(np.float32)
-    n = flat.shape[0]
-    idx = np.random.choice(n, size=min(50000, n), replace=False)
-    sample = flat[idx]
-    km = KMeans(n_clusters=k, n_init=4, random_state=0)
-    km.fit(sample)
-    labels = km.predict(flat)
-    centers = km.cluster_centers_.astype(np.uint8)
-    quant = centers[labels].reshape(h, w, 3)
-    return quant
+def compose_mosaic(tile_bank: TileBank, idxs: np.ndarray, dims: Tuple[int,int,int,int], grid_n: int, tile_px: int) -> Image.Image:
+    w, h, cell_w, cell_h = dims
+    out = Image.new("RGB", (w, h))
+    k = 0
+    for gy in range(grid_n):
+        for gx in range(grid_n):
+            tile_img = tile_bank.tile_images[int(idxs[k])]
+            k += 1
+            inner = min(tile_px, cell_w, cell_h)  # clamp ≤ cell size
+            out.paste(downsample_then_scale(tile_img, inner, cell_w, cell_h), (gx * cell_w, gy * cell_h))
+    return out
 
-# =======================
-# Mapping: cells -> tiles
-# =======================
-def map_cells_to_tiles(mean_rgb: np.ndarray, tiles_lab: np.ndarray, tiles: List[np.ndarray]) -> np.ndarray:
-    R, C, _ = mean_rgb.shape
-    lab = rgb2lab(mean_rgb / 255.0).reshape(-1, 3).astype(np.float32)
-    diff = lab[:, None, :] - tiles_lab[None, :, :]
-    dist2 = np.sum(diff * diff, axis=2)
-    nn = np.argmin(dist2, axis=1)
-    th, tw = tiles[0].shape[:2]
-    mosaic = np.zeros((R*th, C*tw, 3), dtype=np.uint8)
-    for idx, t_idx in enumerate(nn):
-        i = idx // C
-        j = idx % C
-        mosaic[i*th:(i+1)*th, j*tw:(j+1)*tw] = tiles[t_idx]
-    return mosaic
 
-def segment_preview(src: np.ndarray, cell: int) -> np.ndarray:
-    mean_rgb, R, C = grid_mean_colors_vectorized(src, cell)
-    out = np.zeros_like(src)
-    for i in range(R):
-        for j in range(C):
-            out[i*cell:(i+1)*cell, j*cell:(j+1)*cell] = mean_rgb[i, j]
-    return out.astype(np.uint8)
+# ----------------------------
+# Metrics
+# ----------------------------
+def compute_metrics(original_rgb: np.ndarray, mosaic_rgb: np.ndarray):
+    mse = float(np.mean((original_rgb - mosaic_rgb) ** 2))
+    ssim_vals = []
+    for c in range(3):
+        ssim_vals.append(ssim_metric(original_rgb[..., c].astype(np.uint8),
+                                     mosaic_rgb[..., c].astype(np.uint8),
+                                     data_range=255))
+    return mse, float(np.mean(ssim_vals))
 
-# =======================
-# Full pipeline (tiles always from CIFAR-100)
-# =======================
-def build_mosaic(
-    input_image: Image.Image,
-    cell_size: int = 32,
-    use_vectorized: bool = True,
-    quant_k: int = 0,
-    similarity_metric: str = "SSIM",
-    preview_downscale_short_side: int = 768
-):
-    if input_image is None:
-        raise gr.Error("Please upload an input image.")
 
-    # 1) Preprocess input
-    src = pil_to_np(input_image)
-    src = resize_short_side(src, preview_downscale_short_side)
-    src = center_crop_to_multiple(src, cell_size)
+# ----------------------------
+# Global tilebank cache
+# ----------------------------
+_TILEBANKS = {}  # key: sample_size -> TileBank
 
-    # 2) Optional quantization (preview only)
-    _ = quantize_image_kmeans(src, quant_k) if quant_k > 0 else src
+def get_tilebank(sample_size: int) -> TileBank:
+    key = int(sample_size)
+    if key not in _TILEBANKS:
+        tb = TileBank()
+        tb.load(sample_size=sample_size)
+        _TILEBANKS[key] = tb
+    return _TILEBANKS[key]
 
-    # 3) Grid means
-    t0 = time.perf_counter()
-    if use_vectorized:
-        mean_rgb, R, C = grid_mean_colors_vectorized(src, cell_size)
-    else:
-        mean_rgb, R, C = grid_mean_colors_loop(src, cell_size)
-    t_grid = time.perf_counter() - t0
 
-    # 4) Tiles from CIFAR-100 (cached & resized to cell_size)
-    tiles, tiles_lab = _tiles_for_cell_size(cell_size)
+# ----------------------------
+# Gradio callback
+# ----------------------------
+def run_pipeline(img: Image.Image,
+                 grid_size_choice: str,
+                 tile_px_choice: str,
+                 tile_sample_size: int,
+                 quantize_on: bool,
+                 quantize_colors: int,
+                 show_grid_overlay: bool):
 
-    # 5) Map & build mosaic
-    t1 = time.perf_counter()
-    mosaic = map_cells_to_tiles(mean_rgb, tiles_lab, tiles)
-    t_map = time.perf_counter() - t1
+    if img is None:
+        return None, None, None, None, None, None, "Please upload an image."
 
-    # 6) Similarity (resize to input size for fair comparison)
-    H, W = src.shape[:2]
-    mosaic_rs = np.asarray(Image.fromarray(mosaic).resize((W, H), Image.BILINEAR))
-    if similarity_metric == "MSE":
-        score = mse(src, mosaic_rs)
-        score_label = f"MSE: {score:.2f}"
-    else:
-        score = ssim(src, mosaic_rs, channel_axis=2, data_range=255)
-        score_label = f"SSIM: {score:.4f}"
+    grid_n = int(grid_size_choice)
+    tile_px = int(tile_px_choice)  # per-tile inner resolution (px)
 
-    timing = f"Grid: {t_grid*1000:.1f} ms | Mapping: {t_map*1000:.1f} ms | Total: {(t_grid+t_map)*1000:.1f} ms"
-    seg_prev = segment_preview(src, cell_size)
+    # Crop for exact cell division
+    base = crop_to_multiple(img.convert("RGB"), grid_n)
 
-    return (
-        np_to_pil(src),
-        np_to_pil(seg_prev),
-        np_to_pil(mosaic_rs),
-        score_label,
-        timing,
-        f"{R} x {C} cells (cell={cell_size}px) | tiles={len(tiles)} from {HF_DATASET}"
+    # Optional quantization (before computing cell means)
+    preproc = maybe_quantize(base, quantize_on, quantize_colors)
+
+    # Segmented (grid overlay) for display
+    segmented = overlay_grid(preproc, grid_n) if show_grid_overlay else preproc
+
+    # Load/prepare tile bank
+    t_load0 = time.perf_counter()
+    tilebank = get_tilebank(tile_sample_size)
+    t_load1 = time.perf_counter()
+    load_time = t_load1 - t_load0
+
+    # Compute cell means once (LAB vectorized)
+    orig_arr, dims, means = prepare_cells_and_means(preproc, grid_n)
+
+    # --- Vectorized pipeline ---
+    t_vec0 = time.perf_counter()
+    idxs_vec = tilebank.nearest_tile_indices(means, vectorized=True)
+    mosaic_vec = compose_mosaic(tilebank, idxs_vec, dims, grid_n, tile_px)
+    t_vec1 = time.perf_counter()
+    vec_time = t_vec1 - t_vec0
+    mse_vec, ssim_vec = compute_metrics(orig_arr, pil_to_np_rgb(mosaic_vec))
+
+    # --- Loop pipeline ---
+    t_loop0 = time.perf_counter()
+    idxs_loop = tilebank.nearest_tile_indices(means, vectorized=False)
+    mosaic_loop = compose_mosaic(tilebank, idxs_loop, dims, grid_n, tile_px)
+    t_loop1 = time.perf_counter()
+    loop_time = t_loop1 - t_loop0
+    mse_loop, ssim_loop = compute_metrics(orig_arr, pil_to_np_rgb(mosaic_loop))
+
+    total_time = load_time + vec_time + loop_time
+
+    # Save mosaics to temp files for download buttons
+    tmp_vec = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    mosaic_vec.save(tmp_vec.name, format="PNG")
+    vec_path = tmp_vec.name
+
+    tmp_loop = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    mosaic_loop.save(tmp_loop.name, format="PNG")
+    loop_path = tmp_loop.name
+
+    w, h, cell_w, cell_h = dims
+    report = (
+        f"Grid: {grid_n}×{grid_n} | Cells: {cell_w}×{cell_h}px each | Tile Size (px): {tile_px} (auto-clamped ≤ cell)\n"
+        f"Tiles used: {tile_sample_size}\n"
+        f"Quantization: {'ON' if quantize_on else 'OFF'}"
+        f"{f' ({quantize_colors} colors)' if quantize_on else ''}\n"
+        f"Tile load/precompute: {load_time:.3f}s | Total (all): {total_time:.3f}s\n"
+        f"[Vectorized]  Time: {vec_time:.3f}s | MSE: {mse_vec:.2f} | SSIM: {ssim_vec:.4f}\n"
+        f"[Loop]       Time: {loop_time:.3f}s | MSE: {mse_loop:.2f} | SSIM: {ssim_loop:.4f}"
     )
 
-# =======================
-# Performance sweep
-# =======================
-def perf_sweep(input_image: Image.Image, grid_sizes: List[int] = [16, 24, 32, 40, 48, 64]):
-    if input_image is None:
-        return "Please provide an input image first."
-    src = pil_to_np(input_image)
-    src = resize_short_side(src, 768)
-    rows = [["Grid(px)", "Vectorized(ms)", "Loop(ms)"]]
-    for g in grid_sizes:
-        img = center_crop_to_multiple(src, g)
-        t0 = time.perf_counter()
-        _ = grid_mean_colors_vectorized(img, g)
-        v_ms = (time.perf_counter() - t0) * 1000
-        t1 = time.perf_counter()
-        _ = grid_mean_colors_loop(img, g)
-        l_ms = (time.perf_counter() - t1) * 1000
-        rows.append([g, f"{v_ms:.1f}", f"{l_ms:.1f}"])
-    md = "| Grid(px) | Vectorized(ms) | Loop(ms) |\n|---:|---:|---:|\n"
-    for r in rows[1:]:
-        md += f"| {r[0]} | {r[1]} | {r[2]} |\n"
-    return md
+    # Return both mosaics AND the two file paths for the download buttons
+    return base, segmented, mosaic_vec, mosaic_loop, vec_path, loop_path, report
 
-# =======================
-# Gradio UI (simplified)
-# =======================
-EXAMPLES_DIR = Path("examples")
-EXAMPLES_DIR.mkdir(exist_ok=True)
-if not (EXAMPLES_DIR / "gradient1.png").exists():
-    g1 = np.tile(np.linspace(0, 255, 640, dtype=np.uint8), (480,1))
-    grad1 = np.dstack([g1, np.flipud(g1).copy(), np.roll(g1, 160, axis=1)])
-    Image.fromarray(grad1).save(EXAMPLES_DIR/"gradient1.png")
 
-with gr.Blocks(title="Image Mosaic (CIFAR-100 tiles)", css="footer {visibility: hidden}") as demo:
-    gr.Markdown(
-        f"""
-        # 🧩 Image Mosaic Generator (tiles from `{HF_DATASET}`)
-        - Tiles auto-loaded from **Hugging Face** dataset: `{HF_DATASET}` (split `{HF_SPLIT}`, limit {TILE_LIMIT}).  
-        - Upload an image and generate a mosaic immediately.
-        """
-    )
-    with gr.Row():
-        with gr.Column(scale=1):
-            inp = gr.Image(type="pil", label="Input image")
-            gr.Examples(
-                examples=[[str(EXAMPLES_DIR/"gradient1.png")]],
-                inputs=[inp],
-                label="Example"
-            )
-            cell = gr.Slider(16, 128, value=32, step=2, label="Grid cell size (px)")
+# ----------------------------
+# Gradio UI
+# ----------------------------
+def build_demo():
+    with gr.Blocks(title="Interactive Image Mosaic Generator") as demo:
+        gr.Markdown(
+            """
+            # Interactive Image Mosaic Generator
+            - **Grid size = number of tiles per side** (e.g., 32 ⇒ 32×32).
+            - **Tile Size (px)** = internal resolution per tile (downsample then scale), usually **smaller** than the cell size.
+            - Tiles: **Hugging Face `uoft-cs/cifar100`** (fallback: `cifar100`).
+            - **Both implementations** run each time: Vectorized & Loop (reference).
+            - Optional **color quantization** before analysis.
+            """
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                img_in = gr.Image(type="pil", label="Upload Image")
 
-            quant_k = gr.Slider(0, 24, value=0, step=1, label="Optional color quantization (k-means K)")
-            similarity = gr.Radio(choices=["SSIM", "MSE"], value="SSIM", label="Similarity metric")
-            vec = gr.Checkbox(value=True, label="Use vectorized NumPy (uncheck for loop baseline)")
-            run = gr.Button("Generate Mosaic", variant="primary")
+                grid_size = gr.Radio(
+                    choices=["16", "32", "64", "128"],
+                    value="32",
+                    label="Grid size (cells per side)"
+                )
 
-        with gr.Column(scale=1):
-            orig = gr.Image(label="Original (cropped/resized)", interactive=False)
-            seg = gr.Image(label="Segmented (cell means)", interactive=False)
-            out = gr.Image(label="Mosaic", interactive=False)
+                tile_px = gr.Radio(
+                    choices=["8", "16", "24", "32"],
+                    value="16",
+                    label="Tile Size (px, ≤ cell size)"
+                )
 
-            with gr.Row():
-                sim_out = gr.Label(label="Similarity")
-                time_out = gr.Label(label="Timing")
-            meta = gr.Label(label="Grid / Tiles info")
+                tile_sample_size = gr.Slider(
+                    minimum=256,
+                    maximum=10000,
+                    step=256,
+                    value=2048,
+                    label="Number of tiles to sample from CIFAR-100"
+                )
 
-            gr.Markdown("### Performance sweep")
-            perf_btn = gr.Button("Run Performance Sweep")
-            perf_table = gr.Markdown()
+                with gr.Accordion("Preprocessing: Color Quantization (optional)", open=False):
+                    quantize_on = gr.Checkbox(value=False, label="Apply color quantization")
+                    quantize_colors = gr.Slider(
+                        minimum=8, maximum=128, step=8, value=32,
+                        label="Quantization palette size (colors)"
+                    )
 
-    run.click(
-        build_mosaic,
-        inputs=[inp, cell, vec, quant_k, similarity],
-        outputs=[orig, seg, out, sim_out, time_out, meta]
-    )
-    perf_btn.click(perf_sweep, inputs=[inp], outputs=[perf_table])
+                show_grid = gr.Checkbox(value=True, label="Show grid overlay on segmented preview")
+                run_btn = gr.Button("Generate Mosaic", variant="primary")
+
+            with gr.Column(scale=2):
+                with gr.Tab("Original (cropped)"):
+                    img_orig = gr.Image(label="Original (cropped to grid multiple)")
+                with gr.Tab("Segmented"):
+                    img_seg = gr.Image(label="Segmented (grid overlay / preprocessed)")
+                with gr.Tab("Mosaic — Vectorized (Fast)"):
+                    img_vec = gr.Image(label="Vectorized Mosaic")
+                    download_vec = gr.DownloadButton(label="⬇️ Download Vectorized Mosaic")
+                with gr.Tab("Mosaic — Loop (Reference)"):
+                    img_loop = gr.Image(label="Loop Mosaic")
+                    download_loop = gr.DownloadButton(label="⬇️ Download Loop Mosaic")
+                report = gr.Textbox(label="Metrics & Timing", lines=8)
+
+        run_btn.click(
+            fn=run_pipeline,
+            inputs=[img_in, grid_size, tile_px, tile_sample_size, quantize_on, quantize_colors, show_grid],
+            outputs=[img_orig, img_seg, img_vec, img_loop, download_vec, download_loop, report]
+        )
+
+    return demo
+
 
 if __name__ == "__main__":
-    # Preload tiles at startup so first run is snappy
-    try:
-        _load_tiles_raw_32(TILE_LIMIT)
-    except Exception as e:
-        print("Warning: failed to preload tiles:", e)
+    demo = build_demo()
     demo.launch()
